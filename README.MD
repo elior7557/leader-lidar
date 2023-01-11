@@ -12,4 +12,5 @@ The following tasks were completed:
 * Implemented end-to-end testing using a simulator and executing tests from test files.
 
 * Created a Multi-Branch Pipeline (MBP) in Jenkins that performs both CI and Release according to the instructions provided.
-Configured remote artifact repositories in pom.xmls or settings.xml.
+  
+* Configured remote artifact repositories in pom.xmls or settings.xml.
