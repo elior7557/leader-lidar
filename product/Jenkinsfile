@@ -1,0 +1,144 @@
+//Increment tag of a tag
+def increment_tag(tag) {
+  // Extract the parts of the tag
+    def major = tag.split("\\.")[0]
+    def minor = tag.split("\\.")[1]
+    def patch
+    try{
+        patch = tag.split("\\.")[2]
+    }
+    catch (Exception e)
+    {
+        patch = 0
+    }
+    
+    patch = patch.toInteger() + 1
+
+    def incremented_tag = "${major}.${minor}.${patch}"
+   return incremented_tag
+}
+
+//Gets a branch name and return a version
+//release/1.0 >> 1.0.0
+//release/1.1 >> 1.1.0
+//release/2.0 >> 2.0.0
+def get_min_version(branch_name){
+    def version = branch_name.split("/")[1]
+    return "${version}.0"
+}
+
+def get_max_version(min_ver){
+    def major = min_ver.split("\\.")[0]
+    def minor = min_ver.split("\\.")[1]
+    def patch = min_ver.split("\\.")[2]
+    minor = minor.toInteger() + 1
+    def max_tag = "${major}.${minor}.${patch}"
+    return max_tag 
+}
+
+def scm_tag
+def min_version
+def max_version
+
+
+pipeline{
+    agent any
+    tools{
+      jdk 'jdk-8'
+      maven 'mvn'
+    }
+    
+    options {
+      gitLabConnection('gitlab_connection')
+      timestamps()
+    }
+
+    stages{
+        stage("checkout"){
+            when { branch "release/*" }
+            steps{
+                deleteDir()
+                checkout scm
+                sh "git checkout ${env.BRANCH_NAME}"
+            }
+        }
+        stage("build + unit-test"){
+            when { branch "release/*" }
+            steps{
+                //sh "mvn package"
+                //sh "mvn versions:display-dependency-updates | grep 'com.lidar'"
+
+                //Get the tag of the last branch
+                withCredentials([gitUsernamePassword(credentialsId: "aec0528f-ae70-4d3c-9ee0-4957a17a679f", gitToolName: 'git-tool')]) {   
+                    sh "git pull"   
+                }
+                script{ 
+                    def majorMinor = env.BRANCH_NAME.split("/")[1]
+                    def current_tag = sh(returnStdout: true, script: "git describe --tags --abbrev=0 | grep -E '^$majorMinor' || echo ${env.BRANCH_NAME} | cut -d'/' -f2 ").trim()
+                    echo "current tag is $current_tag" 
+                    scm_tag = increment_tag(current_tag)
+                    echo "current tag is $scm_tag"
+                    //Calculate value of version
+                    min_version = get_min_version(env.BRANCH_NAME)
+                    max_version = get_max_version(min_version)
+                    echo "${min_version}-${max_version}"
+                     
+                }
+                withMaven(maven: 'mvn', mavenSettingsConfig: 'configforartifact') {
+                    sh "mvn versions:display-dependency-updates | grep 'com.lidar'"
+                    sh "mvn versions:set -DnewVersion=${scm_tag}"
+                    sh "mvn verify -DskipTests -Dtelemetry.version='[${min_version},${max_version})' -Danalytics.version='[${min_version},${max_version})'" 
+                }
+
+
+            }
+        }
+        
+        stage("e2e"){
+            when { branch "release/*" }
+            steps{
+                withCredentials( [usernamePassword( credentialsId: 'artifactory',  usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]){
+                                
+                sh 'bash product-e2e.sh ${USERNAME} ${PASSWORD}'
+                }
+                
+            } 
+        }
+        
+
+        //Publish to artifactrory
+        stage("publish to relase"){  
+            when { branch "release/*" }
+            steps{ 
+                 //publish to artifactory with a new version
+                withMaven(maven: 'mvn', mavenSettingsConfig: 'configforartifact') {
+                    sh "mvn versions:display-dependency-updates | grep 'com.lidar'"
+                    sh "mvn versions:set -DnewVersion=${scm_tag}"
+                    sh "mvn deploy -DskipTests -Dtelemetry.version='[${min_version},${max_version})' -Danalytics.version='[${min_version},${max_version})'"        
+                }
+            }
+        }
+
+
+        
+        
+        stage("updae scm with a new tag"){
+            when { branch "release/*" }
+            steps{
+                withCredentials([gitUsernamePassword(credentialsId: "aec0528f-ae70-4d3c-9ee0-4957a17a679f", gitToolName: 'git-tool')]) {   
+                    sh """
+                        git tag ${scm_tag}
+                        git push --tags 
+                       """                
+                }  
+            }
+        }
+
+
+    }
+    post{
+        failure{ updateGitlabCommitStatus name: 'build', state: 'failed' }
+        success{ updateGitlabCommitStatus name: 'build', state: 'success'}
+        aborted{ updateGitlabCommitStatus name: 'build', state: 'canceled' }
+    }
+}

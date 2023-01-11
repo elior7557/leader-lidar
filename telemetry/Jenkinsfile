@@ -1,0 +1,155 @@
+//Increment tag of a tag
+def increment_tag(tag) {
+  // Extract the parts of the tag
+    def major = tag.split("\\.")[0]
+    def minor = tag.split("\\.")[1]
+    def patch
+    try{
+        patch = tag.split("\\.")[2]
+    }
+    catch (Exception e)
+    {
+        patch = 0
+    }
+    
+    patch = patch.toInteger() + 1
+
+    def incremented_tag = "${major}.${minor}.${patch}"
+   return incremented_tag
+} 
+
+def lastCommitIsE2e() {
+    lastCommit = sh([script: 'git log -1', returnStdout: true])
+    if (lastCommit.contains("#e2e")) {
+        return true
+    } else {
+        return false
+    }
+}
+
+def scm_tag
+def e2e_test
+def branch_version 
+
+pipeline{
+    agent any
+    tools{
+      jdk 'jdk-8'
+      maven 'mvn'
+    }
+    
+    options {
+      gitLabConnection('gitlab_connection')
+      timestamps()
+    }
+
+    stages{
+        stage("checkout"){
+            steps{
+                deleteDir()
+                checkout scm
+                sh "echo ${env.BRANCH_NAME}"
+                sh "git checkout ${env.BRANCH_NAME}"
+            }
+        }
+        stage("build + unit-test"){
+            when { anyOf { branch "main"; branch "feature/*"; branch "release/*" } }
+            steps{
+                sh "mvn package"
+            }
+        }
+
+        stage("Check commit message in feature branch"){
+            when { branch "feature/*" }
+            steps{
+                script{
+                    if (lastCommitIsE2e()) {
+                        echo "#e2e detected"
+                        e2e_test = true
+                    } else {
+                        e2e_test = false
+                    }
+                }
+            }
+
+        }
+
+
+        stage("e2e"){
+            when { expression { return e2e_test || ( env.BRANCH_NAME.find(/^release\/.*/) || env.BRANCH_NAME == "main" )}  }
+            steps{
+                
+                script{
+                     withCredentials( [usernamePassword( credentialsId: 'artifactory',  usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]){
+
+                        if (e2e_test || env.BRANCH_NAME == "main" ){
+                            echo "e2e on feature branch will be executed here, The e2e will be using the latest snapshot"
+                            sh 'bash telementry-e2e.sh ${USERNAME} ${PASSWORD}' 
+                        }else{
+                            echo "e2e on relase"
+                            branch_version = sh(script: "echo ${env.BRANCH_NAME} | cut -d '/' -f2",returnStdout: true).trim()                    
+                            sh "echo ${branch_version}" 
+                            sh "bash telementry-e2e.sh ${USERNAME} ${PASSWORD} ${branch_version}"  
+
+                        }
+                    }
+                }
+            }
+        }  
+
+
+ 
+
+        //only for main
+        stage("publish"){
+            when { branch "main" }
+            steps{
+                withMaven(maven: 'mvn', mavenSettingsConfig: 'configforartifact') {
+                    sh"mvn deploy -DskipTests" 
+                }
+            }
+        } 
+   
+        stage("publish to relase"){ 
+            when { branch "release/*" }
+            steps{
+                script{
+                    def majorMinor = env.BRANCH_NAME.split("/")[1]
+                    sh "git checkout ${env.BRANCH_NAME}"
+                    withCredentials([gitUsernamePassword(credentialsId: "aec0528f-ae70-4d3c-9ee0-4957a17a679f", gitToolName: 'git-tool')]) {   
+                    sh """
+                        git pull 
+                       """                
+                    }
+                    def current_tag = sh(returnStdout: true, script: "git describe --tags --abbrev=0 | grep -E '^$majorMinor' || echo ${env.BRANCH_NAME} | cut -d'/' -f2 ").trim()
+                    echo "current tag is $current_tag"
+                    scm_tag = increment_tag(current_tag)
+                    echo "current tag is $scm_tag"
+                }
+                //publish to artifactory with a new version 
+                withMaven(maven: 'mvn', mavenSettingsConfig: 'configforartifact') {
+                    sh "mvn versions:set -DnewVersion=${scm_tag}"
+                    sh "mvn deploy -DskipTests"
+                }
+            }
+        }  
+
+        stage("updae scm with a new tag"){
+            when { branch "release/*" }
+            steps{
+                withCredentials([gitUsernamePassword(credentialsId: "aec0528f-ae70-4d3c-9ee0-4957a17a679f", gitToolName: 'git-tool')]) {   
+                    sh """
+                        git tag ${scm_tag}
+                        git push --tags
+                       """                
+                }
+            }
+        }
+    }
+
+    post{
+        failure{ updateGitlabCommitStatus name: 'build', state: 'failed' }
+        success{ updateGitlabCommitStatus name: 'build', state: 'success'}
+        aborted{ updateGitlabCommitStatus name: 'build', state: 'canceled' }
+    }
+}

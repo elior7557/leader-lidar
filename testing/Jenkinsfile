@@ -1,0 +1,49 @@
+pipeline{
+    agent any
+    tools{
+      jdk 'jdk-8'
+      maven 'mvn'
+    }
+    
+    options {
+      gitLabConnection('gitlab_connection')
+      timestamps()
+    }
+
+    stages{
+        stage("checkout"){
+            steps{
+                deleteDir()
+                checkout scm
+            }
+        }
+        stage("build + unit-test"){
+            steps{
+                sh "mvn package"
+            }
+        }
+
+        stage("e2e"){
+            steps{
+                 withCredentials( [usernamePassword( credentialsId: 'artifactory',  usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]){
+                    sh 'bash testing-e2e.sh ${USERNAME} ${PASSWORD}'
+                    sh "java -cp ./test_files/telemetry.jar:./test_files/analytics.jar:./target/simulator-99-SNAPSHOT.jar com.lidar.simulation.Simulator"
+                }
+
+            }
+        }
+        //only for main
+        stage("publish"){
+            steps{
+                withMaven(maven: 'mvn', mavenSettingsConfig: 'configforartifact') {
+                    sh"mvn deploy -DskipTests"
+                }
+            }
+        }
+    }
+    post{
+        failure{ updateGitlabCommitStatus name: 'build', state: 'failed' }
+        success{ updateGitlabCommitStatus name: 'build', state: 'success'}
+        aborted{ updateGitlabCommitStatus name: 'build', state: 'canceled' }
+    }
+}
